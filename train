@@ -1,0 +1,620 @@
+# Huấn luyện DeepLabV3 cải tiến để phân đoạn người (thay thế Mediapipe)
+
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.models.segmentation import deeplabv3_resnet50, deeplabv3_resnet101
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import matplotlib.pyplot as plt
+import json
+import logging
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# Thiết lập logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Kiểm tra thiết bị
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Sử dụng thiết bị: {device}")
+if torch.cuda.is_available():
+    logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+    logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+
+class Config:
+    """Cấu hình training"""
+    # Paths
+    BASE_DATA_PATH = '/content/drive/MyDrive/segmentation_full_body_tik_tok_2615_img'
+    IMAGE_DIR = os.path.join(BASE_DATA_PATH, 'images')
+    MASK_DIR = os.path.join(BASE_DATA_PATH, 'masks')
+    
+    # Model
+    MODEL_NAME = 'deeplabv3_resnet101'  # resnet50 hoặc resnet101
+    INPUT_SIZE = (320, 320)  # Tăng kích thước input
+    NUM_CLASSES = 2
+    
+    # Training
+    BATCH_SIZE = 12  # Giảm batch size để tăng input size
+    LEARNING_RATE = 2e-4
+    WEIGHT_DECAY = 1e-4
+    NUM_EPOCHS = 150
+    WARMUP_EPOCHS = 10
+    
+    # Validation
+    VAL_SPLIT = 0.15
+    TEST_SPLIT = 0.1
+    
+    # Early stopping
+    EARLY_STOPPING_PATIENCE = 20
+    
+    # Loss weights
+    CE_WEIGHT = 1.0
+    DICE_WEIGHT = 1.0
+    FOCAL_WEIGHT = 0.5
+    
+    # Augmentation
+    MIXUP_ALPHA = 0.2
+    CUTMIX_ALPHA = 1.0
+    
+    # Scheduler
+    SCHEDULER_PATIENCE = 8
+    SCHEDULER_FACTOR = 0.7
+    
+    # Checkpoints
+    SAVE_EVERY_N_EPOCHS = 10
+    SAVE_BEST_ONLY = True
+
+class ImprovedSegmentationDataset(Dataset):
+    def __init__(self, image_dir, mask_dir, images, config, is_train=True):
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.images = images
+        self.config = config
+        self.is_train = is_train
+        
+        # Augmentations mạnh hơn cho training
+        if self.is_train:
+            self.augment = A.Compose([
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.1),
+                A.ShiftScaleRotate(
+                    shift_limit=0.1, scale_limit=0.2, rotate_limit=30, 
+                    border_mode=cv2.BORDER_CONSTANT, value=0, p=0.7
+                ),
+                A.OneOf([
+                    A.ElasticTransform(p=0.3, alpha=50, sigma=5),
+                    A.GridDistortion(p=0.3, num_steps=5, distort_limit=0.1),
+                    A.OpticalDistortion(p=0.3, distort_limit=0.1),
+                ], p=0.3),
+                A.OneOf([
+                    A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+                    A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20),
+                    A.RGBShift(r_shift_limit=25, g_shift_limit=25, b_shift_limit=25),
+                ], p=0.8),
+                A.OneOf([
+                    A.GaussNoise(var_limit=(10, 50)),
+                    A.MultiplicativeNoise(multiplier=[0.9, 1.1], elementwise=True),
+                    A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5)),
+                ], p=0.4),
+                A.OneOf([
+                    A.MotionBlur(blur_limit=7),
+                    A.MedianBlur(blur_limit=5),
+                    A.GaussianBlur(blur_limit=5),
+                ], p=0.3),
+                A.OneOf([
+                    A.CLAHE(clip_limit=2),
+                    A.Sharpen(alpha=(0.2, 0.5), lightness=(0.5, 1.0)),
+                    A.Emboss(alpha=(0.2, 0.5), strength=(0.2, 0.7)),
+                ], p=0.3),
+                A.Perspective(scale=(0.05, 0.15), p=0.2),
+                A.CoarseDropout(max_holes=8, max_height=32, max_width=32, fill_value=0, p=0.3),
+            ])
+        else:
+            self.augment = None
+        
+        # Transforms cuối
+        self.final_transforms = A.Compose([
+            A.Resize(config.INPUT_SIZE[0], config.INPUT_SIZE[1], interpolation=cv2.INTER_LINEAR),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2(),
+        ])
+    
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        img_name = self.images[idx]
+        img_path = os.path.join(self.image_dir, img_name)
+        mask_name = os.path.splitext(img_name)[0] + '.png'
+        mask_path = os.path.join(self.mask_dir, mask_name)
+        
+        # Đọc ảnh
+        try:
+            image = cv2.imread(img_path)
+            if image is None:
+                raise ValueError(f"Cannot read image: {img_path}")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        except Exception as e:
+            logger.warning(f"Error reading image {img_path}: {e}")
+            image = np.ones((256, 256, 3), dtype=np.uint8) * 128
+        
+        # Đọc mask
+        try:
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise ValueError(f"Cannot read mask: {mask_path}")
+        except Exception as e:
+            logger.warning(f"Error reading mask {mask_path}: {e}")
+            mask = np.zeros((256, 256), dtype=np.uint8)
+        
+        # Chuẩn hóa mask
+        mask = (mask > 127).astype(np.uint8)
+        
+        # Augmentations
+        if self.augment:
+            try:
+                augmented = self.augment(image=image, mask=mask)
+                image, mask = augmented['image'], augmented['mask']
+            except Exception as e:
+                logger.warning(f"Augmentation failed: {e}")
+        
+        # Final transforms
+        try:
+            transformed = self.final_transforms(image=image, mask=mask)
+            image_tensor = transformed['image']
+            mask_tensor = transformed['mask'].long()
+        except Exception as e:
+            logger.error(f"Transform failed: {e}")
+            return None, None
+        
+        return image_tensor, mask_tensor
+
+class FocalLoss(nn.Module):
+    """Focal Loss để xử lý class imbalance"""
+    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+class ImprovedDiceLoss(nn.Module):
+    """Dice Loss cải tiến với multi-class support"""
+    def __init__(self, smooth=1e-6):
+        super(ImprovedDiceLoss, self).__init__()
+        self.smooth = smooth
+    
+    def forward(self, inputs, targets):
+        # Softmax để có xác suất
+        inputs = F.softmax(inputs, dim=1)
+        
+        # Chuyển targets thành one-hot
+        targets_one_hot = F.one_hot(targets, num_classes=2).permute(0, 3, 1, 2).float()
+        
+        # Tính dice cho từng class
+        dice_scores = []
+        for i in range(2):  # background và foreground
+            pred_i = inputs[:, i, :, :]  # [N, H, W]
+            target_i = targets_one_hot[:, i, :, :]  # [N, H, W]
+            
+            # Flatten
+            pred_flat = pred_i.contiguous().view(-1)
+            target_flat = target_i.contiguous().view(-1)
+            
+            intersection = (pred_flat * target_flat).sum()
+            union = pred_flat.sum() + target_flat.sum()
+            dice = (2 * intersection + self.smooth) / (union + self.smooth)
+            dice_scores.append(dice)
+        
+        return 1 - torch.stack(dice_scores).mean()
+
+class CombinedLoss(nn.Module):
+    """Kết hợp nhiều loss functions"""
+    def __init__(self, config):
+        super(CombinedLoss, self).__init__()
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.dice_loss = ImprovedDiceLoss()
+        self.focal_loss = FocalLoss(alpha=1, gamma=2)
+        self.config = config
+    
+    def forward(self, inputs, targets):
+        ce = self.ce_loss(inputs, targets)
+        dice = self.dice_loss(inputs, targets)
+        focal = self.focal_loss(inputs, targets)
+        
+        total_loss = (self.config.CE_WEIGHT * ce + 
+                     self.config.DICE_WEIGHT * dice + 
+                     self.config.FOCAL_WEIGHT * focal)
+        
+        return total_loss, {'ce': ce, 'dice': dice, 'focal': focal, 'total': total_loss}
+
+def mixup_data(x, y, alpha=1.0):
+    """MixUp augmentation"""
+    batch_size = x.size(0)
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1
+    index = torch.randperm(batch_size).to(x.device)
+    
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    
+    return mixed_x, y_a, y_b, lam
+
+def cutmix_data(x, y, alpha=1.0):
+    """CutMix augmentation"""
+    batch_size = x.size(0)
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1
+    index = torch.randperm(batch_size).to(x.device)
+    
+    # Tạo bounding box
+    W, H = x.size(2), x.size(3)
+    cut_ratio = np.sqrt(1 - lam)
+    cut_w = int(W * cut_ratio)
+    cut_h = int(H * cut_ratio)
+    
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+    
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+    
+    x[:, :, bbx1:bbx2, bby1:bby2] = x[index, :, bbx1:bbx2, bby1:bby2]
+    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (W * H))
+    
+    return x, y, y[index], lam
+
+def collate_fn(batch):
+    """Custom collate function để xử lý None values"""
+    # Lọc bỏ các mẫu None
+    batch = [item for item in batch if item[0] is not None and item[1] is not None]
+    if len(batch) == 0:
+        return None, None
+    return torch.utils.data.dataloader.default_collate(batch)
+    """Tính toán các metrics"""
+    metrics = {}
+    
+    # IoU
+    ious = []
+    for cls in range(num_classes):
+        pred_cls = (pred == cls)
+        target_cls = (target == cls)
+        intersection = (pred_cls & target_cls).sum().item()
+        union = (pred_cls | target_cls).sum().item()
+        if union == 0:
+            ious.append(float('nan'))
+        else:
+            ious.append(intersection / union)
+    
+    metrics['iou_bg'] = ious[0] if not np.isnan(ious[0]) else 0
+    metrics['iou_fg'] = ious[1] if not np.isnan(ious[1]) else 0
+    metrics['miou'] = np.nanmean(ious)
+    
+    # Accuracy
+    metrics['accuracy'] = (pred == target).float().mean().item()
+    
+    # F1 Score cho foreground
+    pred_fg = (pred == 1)
+    target_fg = (target == 1)
+    tp = (pred_fg & target_fg).sum().item()
+    fp = (pred_fg & ~target_fg).sum().item()
+    fn = (~pred_fg & target_fg).sum().item()
+    
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    metrics['precision'] = precision
+    metrics['recall'] = recall
+    metrics['f1'] = 2 * precision * recall / (precision + recall + 1e-8)
+    
+    return metrics
+
+def create_model(config):
+    """Tạo model"""
+    if config.MODEL_NAME == 'deeplabv3_resnet50':
+        model = deeplabv3_resnet50(pretrained=True)
+    elif config.MODEL_NAME == 'deeplabv3_resnet101':
+        model = deeplabv3_resnet101(pretrained=True)
+    else:
+        raise ValueError(f"Unknown model: {config.MODEL_NAME}")
+    
+    # Thay đổi classifier
+    model.classifier[4] = nn.Conv2d(256, config.NUM_CLASSES, kernel_size=1)
+    model.aux_classifier = None  # Tắt auxiliary classifier
+    
+    return model
+
+def save_checkpoint(model, optimizer, scheduler, epoch, metrics, config, filename):
+    """Lưu checkpoint"""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'metrics': metrics,
+        'config': config.__dict__,
+    }
+    torch.save(checkpoint, filename)
+    logger.info(f"Checkpoint saved: {filename}")
+
+def load_checkpoint(filename, model, optimizer=None, scheduler=None):
+    """Load checkpoint"""
+    checkpoint = torch.load(filename, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    if optimizer:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if scheduler:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    return checkpoint['epoch'], checkpoint['metrics']
+
+def train_epoch(model, train_loader, criterion, optimizer, config, epoch):
+    """Train một epoch"""
+    model.train()
+    total_loss = 0
+    all_metrics = []
+    
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.NUM_EPOCHS}")
+    
+    for batch_idx, (images, masks) in enumerate(pbar):
+        if images is None or masks is None:
+            continue
+            
+        images, masks = images.to(device), masks.to(device)
+        
+        # Augmentation techniques (chỉ áp dụng cho training)
+        if epoch >= 5:  # Bắt đầu augmentation sau 5 epochs
+            if np.random.random() < 0.3 and config.MIXUP_ALPHA > 0:
+                images, masks_a, masks_b, lam = mixup_data(images, masks, config.MIXUP_ALPHA)
+            elif np.random.random() < 0.2 and config.CUTMIX_ALPHA > 0:
+                images, masks_a, masks_b, lam = cutmix_data(images, masks, config.CUTMIX_ALPHA)
+            else:
+                masks_a, masks_b, lam = masks, masks, 1
+        else:
+            masks_a, masks_b, lam = masks, masks, 1
+        
+        # Forward pass
+        outputs = model(images)['out']
+        
+        # Compute loss
+        if lam == 1:
+            loss, loss_dict = criterion(outputs, masks)
+        else:
+            loss_a, _ = criterion(outputs, masks_a)
+            loss_b, _ = criterion(outputs, masks_b)
+            loss = lam * loss_a + (1 - lam) * loss_b
+            loss_dict = {'total': loss}
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        # Metrics
+        with torch.no_grad():
+            pred = torch.argmax(outputs, dim=1)
+            metrics = compute_metrics(pred, masks)
+            all_metrics.append(metrics)
+        
+        total_loss += loss.item()
+        
+        # Update progress bar
+        pbar.set_postfix({
+            'Loss': f"{loss.item():.4f}",
+            'mIoU': f"{metrics['miou']:.4f}",
+            'F1': f"{metrics['f1']:.4f}"
+        })
+    
+    # Aggregate metrics
+    avg_metrics = {}
+    for key in all_metrics[0].keys():
+        avg_metrics[key] = np.mean([m[key] for m in all_metrics])
+    
+    return total_loss / len(train_loader), avg_metrics
+
+def validate_epoch(model, val_loader, criterion, config):
+    """Validate một epoch"""
+    model.eval()
+    total_loss = 0
+    all_metrics = []
+    
+    with torch.no_grad():
+        for images, masks in tqdm(val_loader, desc="Validating"):
+            if images is None or masks is None:
+                continue
+                
+            images, masks = images.to(device), masks.to(device)
+            outputs = model(images)['out']
+            
+            loss, _ = criterion(outputs, masks)
+            total_loss += loss.item()
+            
+            pred = torch.argmax(outputs, dim=1)
+            metrics = compute_metrics(pred, masks)
+            all_metrics.append(metrics)
+    
+    # Aggregate metrics
+    avg_metrics = {}
+    for key in all_metrics[0].keys():
+        avg_metrics[key] = np.mean([m[key] for m in all_metrics])
+    
+    return total_loss / len(val_loader), avg_metrics
+
+def main():
+    config = Config()
+    
+    # Kiểm tra paths
+    if not os.path.exists(config.IMAGE_DIR):
+        logger.error(f"Image directory not found: {config.IMAGE_DIR}")
+        return
+    if not os.path.exists(config.MASK_DIR):
+        logger.error(f"Mask directory not found: {config.MASK_DIR}")
+        return
+    
+    # Tạo thư mục output
+    os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs('plots', exist_ok=True)
+    
+    # Load data
+    all_images = [f for f in os.listdir(config.IMAGE_DIR) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    logger.info(f"Found {len(all_images)} images")
+    
+    # Split data
+    train_images, temp_images = train_test_split(all_images, test_size=config.VAL_SPLIT + config.TEST_SPLIT, random_state=42)
+    val_images, test_images = train_test_split(temp_images, test_size=config.TEST_SPLIT / (config.VAL_SPLIT + config.TEST_SPLIT), random_state=42)
+    
+    logger.info(f"Train: {len(train_images)}, Val: {len(val_images)}, Test: {len(test_images)}")
+    
+    # Create datasets
+    train_dataset = ImprovedSegmentationDataset(config.IMAGE_DIR, config.MASK_DIR, train_images, config, is_train=True)
+    val_dataset = ImprovedSegmentationDataset(config.IMAGE_DIR, config.MASK_DIR, val_images, config, is_train=False)
+    
+    # Create dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, 
+                             num_workers=2, pin_memory=True, drop_last=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, 
+                           num_workers=2, pin_memory=True, collate_fn=collate_fn)
+    
+    # Create model
+    model = create_model(config).to(device)
+    logger.info(f"Model created: {config.MODEL_NAME}")
+    
+    # Loss and optimizer
+    criterion = CombinedLoss(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+    
+    # Scheduler với warmup
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=config.SCHEDULER_FACTOR, 
+        patience=config.SCHEDULER_PATIENCE, verbose=True
+    )
+    
+    # Training loop
+    best_miou = 0.0
+    patience_counter = 0
+    history = {'train_loss': [], 'val_loss': [], 'train_miou': [], 'val_miou': [], 'learning_rate': []}
+    
+    logger.info("Starting training...")
+    
+    for epoch in range(config.NUM_EPOCHS):
+        # Warmup learning rate
+        if epoch < config.WARMUP_EPOCHS:
+            warmup_lr = config.LEARNING_RATE * (epoch + 1) / config.WARMUP_EPOCHS
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = warmup_lr
+        
+        # Train
+        train_loss, train_metrics = train_epoch(model, train_loader, criterion, optimizer, config, epoch)
+        
+        # Validate
+        val_loss, val_metrics = validate_epoch(model, val_loader, criterion, config)
+        
+        # Scheduler step (sau warmup)
+        if epoch >= config.WARMUP_EPOCHS:
+            scheduler.step(val_metrics['miou'])
+        
+        # Logging
+        current_lr = optimizer.param_groups[0]['lr']
+        logger.info(f"Epoch {epoch+1}/{config.NUM_EPOCHS}")
+        logger.info(f"Train - Loss: {train_loss:.4f}, mIoU: {train_metrics['miou']:.4f}, F1: {train_metrics['f1']:.4f}")
+        logger.info(f"Val - Loss: {val_loss:.4f}, mIoU: {val_metrics['miou']:.4f}, F1: {val_metrics['f1']:.4f}")
+        logger.info(f"Learning Rate: {current_lr:.6f}")
+        
+        # Save history
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_miou'].append(train_metrics['miou'])
+        history['val_miou'].append(val_metrics['miou'])
+        history['learning_rate'].append(current_lr)
+        
+        # Save best model
+        if val_metrics['miou'] > best_miou:
+            best_miou = val_metrics['miou']
+            save_checkpoint(model, optimizer, scheduler, epoch, val_metrics, config, 'checkpoints/best_model.pth')
+            patience_counter = 0
+            logger.info(f"New best model! mIoU: {best_miou:.4f}")
+        else:
+            patience_counter += 1
+        
+        # Save regular checkpoint
+        if (epoch + 1) % config.SAVE_EVERY_N_EPOCHS == 0:
+            save_checkpoint(model, optimizer, scheduler, epoch, val_metrics, config, f'checkpoints/epoch_{epoch+1}.pth')
+        
+        # Early stopping
+        if patience_counter >= config.EARLY_STOPPING_PATIENCE:
+            logger.info(f"Early stopping after {config.EARLY_STOPPING_PATIENCE} epochs without improvement")
+            break
+    
+    # Save final model
+    save_checkpoint(model, optimizer, scheduler, epoch, val_metrics, config, 'checkpoints/final_model.pth')
+    
+    # Plot training history
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Loss
+    axes[0, 0].plot(history['train_loss'], label='Train Loss')
+    axes[0, 0].plot(history['val_loss'], label='Val Loss')
+    axes[0, 0].set_title('Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True)
+    
+    # mIoU
+    axes[0, 1].plot(history['train_miou'], label='Train mIoU')
+    axes[0, 1].plot(history['val_miou'], label='Val mIoU')
+    axes[0, 1].set_title('mIoU')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True)
+    
+    # Learning Rate
+    axes[1, 0].plot(history['learning_rate'])
+    axes[1, 0].set_title('Learning Rate')
+    axes[1, 0].grid(True)
+    
+    # Best metrics summary
+    axes[1, 1].text(0.1, 0.5, f'Best Validation mIoU: {best_miou:.4f}\nFinal Epoch: {epoch+1}', 
+                    transform=axes[1, 1].transAxes, fontsize=12, verticalalignment='center')
+    axes[1, 1].set_title('Training Summary')
+    axes[1, 1].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig('plots/training_history.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Save training history
+    with open('training_history.json', 'w') as f:
+        json.dump(history, f, indent=2)
+    
+    logger.info(f"Training completed! Best mIoU: {best_miou:.4f}")
+    logger.info("Model saved at: checkpoints/best_model.pth")
+
+if __name__ == "__main__":
+    main()
