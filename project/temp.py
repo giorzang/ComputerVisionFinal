@@ -1,15 +1,16 @@
 import os
 import torch
 import numpy as np
+import torch.nn as nn
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
-from sklearn.model_selection import train_test_split
-from albumentations import (Compose, HorizontalFlip, RandomBrightnessContrast,
-                            ShiftScaleRotate, Blur, GaussNoise)
+from torchvision import transforms
 from albumentations.pytorch import ToTensorV2
-from tqdm import tqdm
+from albumentations import Compose, HorizontalFlip, RandomBrightnessContrast, ShiftScaleRotate, Blur, GaussNoise
+from sklearn.model_selection import train_test_split
+from torch.cuda.amp import autocast, GradScaler
 
-from dataset import SegmentationDataset
+from dataset import SegmentationDataset, collate_fn_pad
 from loss import CombinedLoss
 from utils import compute_iou
 from model_init import get_model
@@ -18,7 +19,7 @@ from model_init import get_model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# Augmentations
+# Transform huấn luyện
 train_transform = Compose([
     HorizontalFlip(p=0.5),
     RandomBrightnessContrast(p=0.5),
@@ -41,60 +42,65 @@ train_dataset = SegmentationDataset(IMAGE_DIR, MASK_DIR, train_images, transform
 test_dataset = SegmentationDataset(IMAGE_DIR, MASK_DIR, test_images, transform=test_transform)
 # train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=collate_fn_pad)
 # test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False, collate_fn=collate_fn_pad)
-train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=collate_fn_pad)
+test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False, collate_fn=collate_fn_pad)
 
 # Model, loss, optimizer, scheduler
 model = get_model().to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 loss_fn = CombinedLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+scaler = GradScaler()
 
+# Training loop
 val_mean_ious = []
 loss_history = []
 best_iou = 0
 
-# Training loop
 for epoch in range(20):
     model.train()
     epoch_loss = 0
-    for img, mask in tqdm(train_loader):
+
+    for img, mask in train_loader:
         img, mask = img.to(device), mask.to(device)
         optimizer.zero_grad()
 
-        output = model(img)['out']
-        loss = loss_fn(output, mask)
+        with autocast():
+            output = model(img)['out']
+            loss = loss_fn(output, mask)
         
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         epoch_loss += loss.item()
+    
     loss_history.append(epoch_loss / len(train_loader))
 
     # Validation
     model.eval()
     val_iou = []
+
     with torch.no_grad():
         for img, mask in test_loader:
             img, mask = img.to(device), mask.to(device)
 
             output = model(img)['out']
             pred = torch.argmax(output, dim=1)
-            
+
             iou = compute_iou(pred.cpu(), mask.cpu())
             val_iou.append(iou)
 
     mean_iou = np.nanmean(val_iou)
     val_mean_ious.append(mean_iou)
-
+    
     print(f"Epoch {epoch+1}: Loss = {epoch_loss / len(train_loader):.4f} | Val mIoU = {mean_iou:.4f}")
     scheduler.step(mean_iou)
-    
+
     if mean_iou > best_iou:
         best_iou = mean_iou
-        torch.save(model.state_dict(), "deeplabv3_person_best.pth")
+        torch.save(model.state_dict(), "deeplabv3_person_best_mixed.pth")
 
-# Biểu đồ
+# Graph
 plt.plot(val_mean_ious, marker='o', label='Val mIoU')
 plt.plot(loss_history, label='Train Loss')
 plt.title("Validation Mean IoU & Train Loss per Epoch")

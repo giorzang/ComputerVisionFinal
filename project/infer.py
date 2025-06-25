@@ -7,7 +7,7 @@ from model_init import get_model
 
 # ==== Cấu hình ====
 MODEL_PATH = "deeplabv3_person_best.pth"
-VIRTUAL_BG_PATH = "uocj.jpg"
+VIRTUAL_BG_PATH = "../uocj.jpg"
 TARGET_SIZE = (256, 144)
 
 # ==== Thiết bị ====
