@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,7 +9,6 @@ from albumentations import (Compose, HorizontalFlip, RandomBrightnessContrast,
                             ShiftScaleRotate, Blur, GaussNoise)
 from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
-
 from dataset import SegmentationDataset
 from loss import CombinedLoss
 from utils import compute_iou
@@ -25,7 +25,6 @@ train_transform = Compose([
     ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=10, p=0.7),
     Blur(blur_limit=3, p=0.3),
     GaussNoise(var_limit=(10.0, 50.0), p=0.3),
-    # GaussNoise(mean=0, std=10.0, p=0.3),
     ToTensorV2()
 ])
 test_transform = Compose([ToTensorV2()])
@@ -39,46 +38,58 @@ train_images, test_images = train_test_split(all_images, test_size=0.2, random_s
 
 train_dataset = SegmentationDataset(IMAGE_DIR, MASK_DIR, train_images, transform=train_transform)
 test_dataset = SegmentationDataset(IMAGE_DIR, MASK_DIR, test_images, transform=test_transform)
-# train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=collate_fn_pad)
-# test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False, collate_fn=collate_fn_pad)
-train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False)
+
+train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=4, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False, num_workers=4, pin_memory=True)
 
 # Model, loss, optimizer, scheduler
-model = get_model().to(device)
+model = get_model(pretrained=True).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 loss_fn = CombinedLoss()
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+scaler = torch.amp.GradScaler()
 
 val_mean_ious = []
 loss_history = []
 best_iou = 0
+accumulation_steps = 32
 
 # Training loop
-for epoch in range(20):
+for epoch in range(35):
     model.train()
     epoch_loss = 0
-    for img, mask in tqdm(train_loader):
+    
+    for i, (img, mask) in enumerate(tqdm(train_loader, desc="Training")):
         img, mask = img.to(device), mask.to(device)
-        optimizer.zero_grad()
 
-        output = model(img)['out']
-        loss = loss_fn(output, mask)
+        with torch.amp.autocast(device_type=device.type):
+            output = model(img)['out']
+            loss = loss_fn(output, mask)
+            loss /= accumulation_steps
         
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.scale(loss).backward()
+        
+        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):    
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
         epoch_loss += loss.item()
+        
     loss_history.append(epoch_loss / len(train_loader))
 
     # Validation
     model.eval()
     val_iou = []
     with torch.no_grad():
-        for img, mask in test_loader:
+        for img, mask in tqdm(test_loader, desc="Validating"):
             img, mask = img.to(device), mask.to(device)
 
-            output = model(img)['out']
+            with torch.amp.autocast(device_type=device.type):
+                output = model(img)['out']
+                
             pred = torch.argmax(output, dim=1)
             
             iou = compute_iou(pred.cpu(), mask.cpu())
@@ -93,13 +104,21 @@ for epoch in range(20):
     if mean_iou > best_iou:
         best_iou = mean_iou
         torch.save(model.state_dict(), "deeplabv3_person_best.pth")
-
+    
+    torch.cuda.empty_cache()
+    
+    # Giải nhiệt CPU/GPU
+    time.sleep(60)
+    
 # Biểu đồ
-plt.plot(val_mean_ious, marker='o', label='Val mIoU')
-plt.plot(loss_history, label='Train Loss')
-plt.title("Validation Mean IoU & Train Loss per Epoch")
+plt.subplot(121), plt.plot(loss_history, label='Train Loss'), plt.title("Train Loss per Epoch")
 plt.xlabel("Epoch")
 plt.ylabel("Value")
+
+plt.subplot(122), plt.plot(val_mean_ious, label='Val mIoU'), plt.title("Validation Mean IoU per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Value")
+
 plt.legend()
 plt.grid(True)
 plt.show()

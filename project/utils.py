@@ -12,4 +12,3 @@ def compute_iou(pred, target, num_classes=2):
         else:
             ious.append(intersection / union)
     return np.nanmean(ious)
-

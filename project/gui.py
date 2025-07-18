@@ -9,7 +9,7 @@ from torchvision import transforms
 from model_init import get_model
 
 # ==== Cấu hình ====
-MODEL_PATH = "model3.pth"              # hoặc checkpoint.pth của bạn
+MODEL_PATH = "model.pth"              # hoặc checkpoint.pth của bạn
 TARGET_SIZE = (640, 360)               # (width, height)
 BLUR_KERNEL = (55, 55)
 
